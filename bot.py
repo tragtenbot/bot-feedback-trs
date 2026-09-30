@@ -2,7 +2,7 @@
 Bot de Feedback - Gerador TRS
 ==============================
 Coleta feedback de interfaces por ciclos via Telegram.
-Áudios são salvos no Google Drive para transcrição manual posterior.
+Áudios são salvos no Google Drive e transcritos automaticamente em português.
 Tudo é organizado no Google Drive por ciclo.
 
 Estrutura no Drive:
@@ -24,6 +24,7 @@ import os
 import json
 import logging
 import tempfile
+import asyncio
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
@@ -51,6 +52,14 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "YOUR_TOKEN_HERE")
 ALLOWED_USER_IDS = []
 DRIVE_ROOT_FOLDER = "FeedbackTRS"
 CYCLE_STATE_FILE = Path(__file__).parent / "ciclo_atual.json"
+
+# No VPS atual (1,9 GiB RAM), large-v3-turbo oferece a melhor qualidade
+# viável sem arriscar OOM. Em máquina com mais memória, use large-v3.
+WHISPER_MODEL_NAME = os.environ.get("WHISPER_MODEL", "large-v3-turbo")
+WHISPER_DEVICE = os.environ.get("WHISPER_DEVICE", "auto")
+WHISPER_COMPUTE_TYPE = os.environ.get("WHISPER_COMPUTE_TYPE", "auto")
+_WHISPER_MODEL = None
+_WHISPER_MODEL_CONFIG = None
 # ─────────────────────────────────────────────
 # Logging
 # ─────────────────────────────────────────────
@@ -222,6 +231,139 @@ def slugify(text: str) -> str:
     return re.sub(r"[\s_]+", "-", text)
 
 
+def transcribe_audio(local_path: str) -> str:
+    """Transcreve um arquivo usando faster-whisper e idioma português."""
+    global _WHISPER_MODEL, _WHISPER_MODEL_CONFIG
+    from faster_whisper import WhisperModel
+
+    requested = (WHISPER_MODEL_NAME, WHISPER_DEVICE, WHISPER_COMPUTE_TYPE)
+    if _WHISPER_MODEL is None or _WHISPER_MODEL_CONFIG != requested:
+        try:
+            _WHISPER_MODEL = WhisperModel(
+                WHISPER_MODEL_NAME,
+                device=WHISPER_DEVICE,
+                compute_type=WHISPER_COMPUTE_TYPE,
+            )
+        except Exception as first_error:
+            if WHISPER_DEVICE == "cpu":
+                raise
+            log.warning(
+                "Whisper não carregou em %s/%s (%s); usando CPU/int8.",
+                WHISPER_DEVICE,
+                WHISPER_COMPUTE_TYPE,
+                first_error,
+            )
+            _WHISPER_MODEL = WhisperModel(
+                WHISPER_MODEL_NAME,
+                device="cpu",
+                compute_type="int8",
+            )
+        _WHISPER_MODEL_CONFIG = requested
+        log.info(
+            "Whisper carregado: modelo=%s dispositivo=%s computação=%s idioma=pt",
+            WHISPER_MODEL_NAME,
+            WHISPER_DEVICE,
+            WHISPER_COMPUTE_TYPE,
+        )
+
+    segments, info = _WHISPER_MODEL.transcribe(
+        local_path,
+        language="pt",
+        beam_size=5,
+        vad_filter=True,
+    )
+    text = " ".join(segment.text.strip() for segment in segments).strip()
+    log.info(
+        "Áudio transcrito: modelo=%s idioma_detectado=%s duração=%.1fs caracteres=%d",
+        WHISPER_MODEL_NAME,
+        getattr(info, "language", "pt"),
+        getattr(info, "duration", 0.0),
+        len(text),
+    )
+    return text or "[Nenhuma fala detectada]"
+
+
+def write_transcript_file(text: str) -> str:
+    """Cria um arquivo temporário UTF-8 com a transcrição."""
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".txt", delete=False, encoding="utf-8"
+    ) as tmp:
+        tmp.write(text + "\n")
+        return tmp.name
+
+
+async def send_long_text(message, text: str) -> None:
+    """Envia a transcrição em partes dentro do limite do Telegram."""
+    limit = 3900
+    chunks = [text[i : i + limit] for i in range(0, len(text), limit)] or [""]
+    await message.reply_text("Transcrição:\n\n" + chunks[0])
+    for chunk in chunks[1:]:
+        await message.reply_text(chunk)
+
+
+async def process_audio_file(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    tmp_path: str,
+    cycle: int,
+    user,
+    caption: str,
+    suffix: str,
+    mime: str,
+    original_stem: str,
+) -> None:
+    """Salva áudio, transcreve, salva .txt no Drive e responde no Telegram."""
+    message = update.effective_message
+    service = build_drive_service()
+    root_id = get_root_folder_id(service)
+    tg_folder_id = get_telegram_folder_id(service, root_id, cycle)
+
+    ts = now().strftime("%Y-%m-%d_%H-%M-%S")
+    sender = slugify(get_sender_name(user))
+    audio_filename = f"{ts}_{sender}_{original_stem}{suffix}"
+    upload_file(service, tmp_path, audio_filename, tg_folder_id, mime)
+
+    await context.bot.send_chat_action(
+        chat_id=message.chat_id,
+        action="typing",
+    )
+    try:
+        transcript = await asyncio.to_thread(transcribe_audio, tmp_path)
+        transcription_status = "transcrição concluída"
+    except Exception as exc:
+        log.exception("[Bot] Erro ao transcrever áudio")
+        transcript = f"[Falha na transcrição: {exc}]"
+        transcription_status = "falha na transcrição"
+
+    transcript_path = write_transcript_file(transcript)
+    try:
+        transcript_filename = f"{ts}_{sender}_{original_stem}.txt"
+        upload_file(
+            service,
+            transcript_path,
+            transcript_filename,
+            tg_folder_id,
+            "text/plain; charset=utf-8",
+        )
+    finally:
+        Path(transcript_path).unlink(missing_ok=True)
+
+    caption_suffix = f" — legenda: {caption}" if caption else ""
+    entry = make_entry(
+        user,
+        "audio_transcrito",
+        f"áudio={audio_filename}; transcrição={transcript_filename}; "
+        f"status={transcription_status}{caption_suffix}",
+    )
+    append_to_feedback_file(service, root_id, cycle, entry)
+
+    await message.reply_text(
+        f"Áudio e transcrição salvos no {cycle_folder_name(cycle)}.\n"
+        f"Status: {transcription_status}."
+    )
+    await send_long_text(message, transcript)
+
+
 # ─────────────────────────────────────────────
 # Handlers de comando
 # ─────────────────────────────────────────────
@@ -305,26 +447,22 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         tg_file = await context.bot.get_file(voice.file_id)
         await tg_file.download_to_drive(tmp_path)
-
-        service = build_drive_service()
-        root_id = get_root_folder_id(service)
-        tg_folder_id = get_telegram_folder_id(service, root_id, cycle)
-
-        ts = now().strftime("%Y-%m-%d_%H-%M-%S")
-        sender = slugify(get_sender_name(user))
-        audio_filename = f"{ts}_{sender}.ogg"
-        url = upload_file(service, tmp_path, audio_filename, tg_folder_id, "audio/ogg")
-
-        label = audio_filename + (f" — {caption}" if caption else "")
-        entry = make_entry(user, "audio", label)
-        append_to_feedback_file(service, root_id, cycle, entry)
-
-        await message.reply_text(f"Áudio salvo no {cycle_folder_name(cycle)}.")
+        await process_audio_file(
+            update,
+            context,
+            tmp_path,
+            cycle,
+            user,
+            caption,
+            suffix=".ogg",
+            mime="audio/ogg",
+            original_stem="voz",
+        )
     except Exception as e:
-        log.error(f"[Bot] Erro ao salvar áudio: {e}")
-        await message.reply_text(f"Erro ao salvar áudio: {e}")
+        log.error(f"[Bot] Erro ao processar áudio de voz: {e}")
+        await message.reply_text(f"Erro ao processar áudio: {e}")
     finally:
-        os.unlink(tmp_path)
+        Path(tmp_path).unlink(missing_ok=True)
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -412,25 +550,22 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         tg_file = await context.bot.get_file(audio.file_id)
         await tg_file.download_to_drive(tmp_path)
-
-        service = build_drive_service()
-        root_id = get_root_folder_id(service)
-        tg_folder_id = get_telegram_folder_id(service, root_id, cycle)
-
-        ts = now().strftime("%Y-%m-%d_%H-%M-%S")
-        sender = slugify(get_sender_name(user))
-        filename = f"{ts}_{sender}_{slugify(Path(original).stem)}.{ext}"
-        url = upload_file(service, tmp_path, filename, tg_folder_id, audio.mime_type or "audio/mp4")
-
-        label = filename + (f" — {caption}" if caption else "")
-        entry = make_entry(user, "audio", label)
-        append_to_feedback_file(service, root_id, cycle, entry)
-        await message.reply_text(f"Áudio salvo no {cycle_folder_name(cycle)}.")
+        await process_audio_file(
+            update,
+            context,
+            tmp_path,
+            cycle,
+            user,
+            caption,
+            suffix=f".{ext}",
+            mime=audio.mime_type or "audio/mp4",
+            original_stem=slugify(Path(original).stem),
+        )
     except Exception as e:
-        log.error(f"[Bot] Erro ao salvar áudio: {e}")
-        await message.reply_text(f"Erro: {e}")
+        log.error(f"[Bot] Erro ao processar arquivo de áudio: {e}")
+        await message.reply_text(f"Erro ao processar áudio: {e}")
     finally:
-        os.unlink(tmp_path)
+        Path(tmp_path).unlink(missing_ok=True)
 
 
 # ─────────────────────────────────────────────
